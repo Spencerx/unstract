@@ -28,6 +28,7 @@ from unstract.core.file_execution_tracker import (
     FileExecutionStageStatus,
     FileExecutionStatusTracker,
 )
+from unstract.core.tool_execution_status import ToolExecutionData, ToolExecutionTracker
 from unstract.workflow_execution.enums import LogComponent, LogStage, LogState
 from unstract.workflow_execution.exceptions import StopExecution
 from workflow_manager.endpoint_v2.destination import DestinationConnector
@@ -37,6 +38,8 @@ from workflow_manager.endpoint_v2.dto import (
     FileHash,
     SourceConfig,
 )
+from workflow_manager.endpoint_v2.enums import AllowedFileTypes
+from workflow_manager.endpoint_v2.exceptions import UnsupportedMimeTypeError
 from workflow_manager.endpoint_v2.models import WorkflowEndpoint
 from workflow_manager.endpoint_v2.result_cache_utils import ResultCacheUtils
 from workflow_manager.endpoint_v2.source import SourceConnector
@@ -142,11 +145,14 @@ class FileExecutionTasks:
                 - execution_id: ID of execution service
                 - single_step: Whether to process in single step mode
         """
+        celery_task_id = self.request.id
         file_batch_data = FileBatchData.from_dict(file_batch_data)
         logger.debug(f"Batch data received: {file_batch_data}")
 
         file_data = file_batch_data.file_data
-        logger.info(f"File processing context {file_data}")
+        logger.info(
+            f"[Celery Task: {celery_task_id}] Processing file with context: {file_data}"
+        )
 
         execution_id = file_data.execution_id
         workflow_id = file_data.workflow_id
@@ -176,7 +182,9 @@ class FileExecutionTasks:
         for file_number, (file_name, file_hash_dict) in enumerate(
             file_batch_data.files, 1
         ):
-            logger.info(f"[{file_number}/{total_files}] Processing file '{file_name}'")
+            logger.info(
+                f"[{celery_task_id}][{file_number}/{total_files}] Processing file '{file_name}'"
+            )
             file_hash = FileHash(
                 file_path=file_hash_dict.get("file_path"),
                 file_name=file_hash_dict.get("file_name"),
@@ -364,6 +372,7 @@ class FileExecutionTasks:
                 execution_id=str(workflow_execution.id),
                 file_execution_id=str(workflow_file_execution.id),
                 organization_id=str(workflow_execution.workflow.organization_id),
+                file_hash=file_hash,
             )
 
             # Check if file execution is already in progress
@@ -375,6 +384,11 @@ class FileExecutionTasks:
                 )
                 # Not required to prepare file again
                 # Not required to check processing history again
+
+                # Set file hash from file execution data
+                file_hash = FileHash.from_json(file_execution_data.file_hash)
+                logger.info(f"File hash {file_hash} set from file execution data")
+
                 if stage.is_before(FileExecutionStage.COMPLETED):
                     # Core Execution Phase
                     execution_result = cls._execute_workflow_steps(
@@ -419,11 +433,22 @@ class FileExecutionTasks:
                 workflow_file_execution,
                 file_hash,
                 workflow_execution,
+                file_data,
+            )
+
+            # Update file execution tracker with updated file hash
+            cls._update_file_execution_tracker(
+                execution_id=str(workflow_execution.id),
+                file_execution_id=str(workflow_file_execution.id),
+                stage=FileExecutionStage.INITIALIZATION,
+                status=FileExecutionStageStatus.IN_PROGRESS,
+                file_hash=file_hash,
             )
 
             # History Check Phase
             if early_result := cls._check_processing_history(
                 destination,
+                source,
                 workflow_execution.workflow,
                 content_hash,
                 file_hash,
@@ -466,7 +491,9 @@ class FileExecutionTasks:
                 organization_id=file_data.organization_id,
                 pipeline_id=str(workflow_execution.pipeline_id),
             )
-            workflow_log.log_error(logger=logger, message=error_msg)
+            workflow_log.log_error(
+                logger=logger, message=error_msg, exc_info=True, stack_info=True
+            )
             result = FinalOutputResult(output=None, metadata=None, error=error_msg)
             return cls._build_final_result(
                 workflow_execution=workflow_execution,
@@ -478,8 +505,13 @@ class FileExecutionTasks:
                 destination=destination,
             )
         except Exception as error:
-            error_msg = f"File execution failed: {error}"
-            workflow_log.log_error(logger=logger, message=error_msg)
+            if isinstance(error, UnsupportedMimeTypeError):
+                error_msg = str(error)
+            else:
+                error_msg = f"File execution failed: {error}"
+                workflow_log.log_error(
+                    logger=logger, message=error_msg, exc_info=True, stack_info=True
+                )
             workflow_file_execution.update_status(
                 status=ExecutionStatus.ERROR, execution_error=error_msg[:500]
             )
@@ -500,6 +532,7 @@ class FileExecutionTasks:
         execution_id: str,
         file_execution_id: str,
         organization_id: str,
+        file_hash: FileHash,
     ) -> FileExecutionData:
         # Initialize file execution tracker
         file_execution_tracker = FileExecutionStatusTracker()
@@ -513,6 +546,7 @@ class FileExecutionTasks:
             organization_id=str(organization_id),
             stage_status=file_execution_stage_data,
             status_history=[],
+            file_hash=file_hash.to_serialized_json(),
         )
         if not file_execution_tracker.exists(execution_id, file_execution_id):
             file_execution_tracker.set_data(file_execution_data)
@@ -526,16 +560,27 @@ class FileExecutionTasks:
         return file_execution_data
 
     @classmethod
-    def _mark_file_execution_tracker_finalization_status(
+    def _update_file_execution_tracker(
         cls,
         execution_id: str,
         file_execution_id: str,
+        stage: FileExecutionStage,
         status: FileExecutionStageStatus,
         error: str | None = None,
+        file_hash: FileHash | None = None,
     ) -> None:
+        if file_hash:
+            # Convert file hash to serialized json for storage
+            file_hash = file_hash.to_serialized_json()
+
+        ttl_in_second = (
+            settings.FILE_EXECUTION_TRACKER_COMPLETED_TTL_IN_SECOND
+            if stage == FileExecutionStage.COMPLETED
+            else None
+        )
         file_execution_tracker = FileExecutionStatusTracker()
         stage_data = FileExecutionStageData(
-            stage=FileExecutionStage.FINALIZATION,
+            stage=stage,
             status=status,
             error=error,
         )
@@ -543,34 +588,24 @@ class FileExecutionTasks:
             execution_id=execution_id,
             file_execution_id=file_execution_id,
             stage_status=stage_data,
+            ttl_in_second=ttl_in_second,
+            file_hash=file_hash,
         )
 
     @classmethod
-    def _mark_file_execution_tracker_completed_status(
+    def delete_tool_execution_tracker(
         cls,
         execution_id: str,
         file_execution_id: str,
-        status: FileExecutionStageStatus,
-        error: str | None = None,
     ) -> None:
-        logger.info(
-            f"Marking file execution tracker completed status for execution_id: {execution_id}, file_execution_id: {file_execution_id}, stage: {FileExecutionStage.COMPLETED.value}, status: {status.value}, error: {error}"
-        )
-        # This is the cache ttl for completed file execution to prevent long term cache
-        COMPLETED_EXECUTION_CACHE_TTL_IN_SECOND = (
-            settings.FILE_EXECUTION_TRACKER_COMPLETED_TTL_IN_SECOND
-        )
-        file_execution_tracker = FileExecutionStatusTracker()
-        stage_data = FileExecutionStageData(
-            stage=FileExecutionStage.COMPLETED,
-            status=status,
-            error=error,
-        )
-        file_execution_tracker.update_stage_status(
+        tool_execution_tracker = ToolExecutionTracker()
+        tool_execution_data = ToolExecutionData(
             execution_id=execution_id,
             file_execution_id=file_execution_id,
-            stage_status=stage_data,
-            ttl_in_second=COMPLETED_EXECUTION_CACHE_TTL_IN_SECOND,
+        )
+        tool_execution_tracker.delete_status(tool_execution_data=tool_execution_data)
+        logger.info(
+            f"Deleted tool execution tracker for execution_id: {execution_id}, file_execution_id: {file_execution_id}"
         )
 
     @classmethod
@@ -637,33 +672,61 @@ class FileExecutionTasks:
         workflow_file_exec: WorkflowFileExecution,
         file_hash: FileHash,
         workflow_execution: WorkflowExecution,
+        file_data: FileData,
     ) -> str:
         """Handle file preparation and volume storage."""
         workflow_file_exec.update_status(ExecutionStatus.EXECUTING)
 
         try:
             logger.info(f"Preparing file for processing: {file_hash.file_name}")
+            if file_hash.mime_type and not AllowedFileTypes.is_allowed(
+                file_hash.mime_type
+            ):
+                raise UnsupportedMimeTypeError(
+                    f"Unsupported MIME type '{file_hash.mime_type}'"
+                )
             content_hash = source.add_file_to_volume(
                 workflow_file_execution=workflow_file_exec,
                 tags=workflow_execution.tag_names,
                 file_hash=file_hash,
+                llm_profile_id=file_data.llm_profile_id,
             )
             file_hash.file_hash = content_hash
             workflow_file_exec.update(file_hash=content_hash)
             return content_hash
+        except UnsupportedMimeTypeError as error:
+            error_msg = f"Unsupported MIME type: {error}"
+            logger_message = f"Skipping file {file_hash.file_name} due to {error_msg}"
+            workflow_log.log_error(logger=logger, message=logger_message)
+
+            # TODO: (Optional) Handle unsupported MIME types in file_history
+            #   Goal: Record failure to prevent retries, but cache_key is missing
+            #   Constraints:
+            #     - cache_key required (NOT NULL) but unavailable (file not fully read)
+            #   Solutions:
+            #     1. Allow null cache_key (schema change)
+            #     2. Generate fallback hash (e.g., f"UNSUPPORTED_{file_hash.file_name}")
+            #     3. Read full file for hash (performance cost)
+            #   Action: Requires team decision on preferred approach.
+            raise
         except FileNotFoundError as error:
             error_msg = f"File not Found in execution dir: {error}"
-            workflow_log.log_error(logger=logger, message=error_msg)
+            workflow_log.log_error(
+                logger=logger, message=error_msg, exc_info=True, stack_info=True
+            )
             raise WorkflowExecutionError(error_msg) from error
         except Exception as error:
             error_msg = f"File preparation failed: {error}"
-            workflow_log.log_error(logger=logger, message=error_msg)
+            workflow_log.log_error(
+                logger=logger, message=error_msg, exc_info=True, stack_info=True
+            )
             raise WorkflowExecutionError(error_msg) from error
 
     @classmethod
     def _check_processing_history(
         cls,
         destination: DestinationConnector,
+        source: SourceConnector,
         workflow: Workflow,
         content_hash: str,
         file_hash: FileHash,
@@ -676,14 +739,21 @@ class FileExecutionTasks:
 
         # Check for existing file processing history by content hash
         file_history = FileHistoryHelper.get_file_history(
-            workflow=workflow, cache_key=content_hash
+            workflow=workflow, cache_key=content_hash, file_path=file_hash.file_path
         )
-        if not file_history:
+        if cls._is_new_file(
+            file_history=file_history,
+            file_hash=file_hash,
+            workflow=workflow,
+        ):
+            logger.info(
+                f"File '{file_hash.file_path}' is treated as *new* in workflow '{workflow}'."
+            )
             return None
 
         workflow_log.log_info(
             logger=logger,
-            message=f"Skipping duplicate file: '{file_hash.file_name}' in workflow '{workflow}' (content hash match)",
+            message=f"Skipping duplicate file: '{file_hash.file_path}' in workflow '{workflow}' (content hash match)",
         )
 
         # Check for provider_file_uuid consistency
@@ -710,6 +780,30 @@ class FileExecutionTasks:
             result=file_history.result,
             metadata=file_history.metadata,
         )
+
+    @classmethod
+    def _is_new_file(
+        cls,
+        file_history: FileHistory,
+        file_hash: FileHash,
+        workflow: Workflow,
+    ) -> bool:
+        """Check if the file is new based on file history and source configuration."""
+        # No history or incomplete history means the file is new
+        if not file_history or not file_history.is_completed():
+            return True
+
+        # Note: To enforce content-only deduplication (ignoring file path), use the `source.use_content_deduplication_only` flag
+        # If enabled, skip the file path comparison and return False here to treat the file as already processed.
+
+        if file_history.file_path and file_hash.file_path != file_history.file_path:
+            logger.info(
+                f"[File Path Mismatch] Existing file path '{file_history.file_path}' does not match expected path "
+                f"'{file_hash.file_path}' for file '{file_hash.file_name}' in workflow '{workflow}'. Marking as new."
+            )
+            return True
+
+        return False
 
     @classmethod
     def _execute_workflow_steps(
@@ -835,9 +929,10 @@ class FileExecutionTasks:
 
         try:
             if destination.use_file_history:
+                file_path = file_hash.file_path if not destination.is_api else None
                 # Collect metadata from file history if available
                 file_history = FileHistoryHelper.get_file_history(
-                    workflow=workflow, cache_key=file_hash.file_hash
+                    workflow=workflow, cache_key=file_hash.file_hash, file_path=file_path
                 )
             else:
                 file_history = None
@@ -862,12 +957,12 @@ class FileExecutionTasks:
                 processing_error=processing_error,
             ):
                 FileHistoryHelper.create_file_history(
+                    is_api=destination.is_api,
                     file_hash=file_hash,
                     workflow=workflow,
                     status=ExecutionStatus.COMPLETED,
                     result=output_result,
                     metadata=execution_metadata,
-                    file_name=file_hash.file_name,
                 )
         except Exception as e:
             error_msg = f"Final output processing failed: {str(e)}"
@@ -941,9 +1036,10 @@ class FileExecutionTasks:
                 if not error
                 else FileExecutionStageStatus.FAILED
             )
-            cls._mark_file_execution_tracker_finalization_status(
+            cls._update_file_execution_tracker(
                 execution_id=str(workflow_file_execution.workflow_execution.id),
                 file_execution_id=str(workflow_file_execution.id),
+                stage=FileExecutionStage.FINALIZATION,
                 status=file_execution_tracker_status,
                 error=error,
             )
@@ -990,11 +1086,19 @@ class FileExecutionTasks:
             if not error
             else FileExecutionStageStatus.FAILED
         )
-        cls._mark_file_execution_tracker_completed_status(
+        logger.info(
+            f"Marking file execution tracker completed status for execution_id: {workflow_execution.id}, file_execution_id: {workflow_file_execution.id}, stage: {FileExecutionStage.COMPLETED.value}, status: {status.value}, error: {error}"
+        )
+        cls._update_file_execution_tracker(
             execution_id=str(workflow_execution.id),
             file_execution_id=str(workflow_file_execution.id),
+            stage=FileExecutionStage.COMPLETED,
             status=status,
             error=error,
+        )
+        cls.delete_tool_execution_tracker(
+            execution_id=str(workflow_execution.id),
+            file_execution_id=str(workflow_file_execution.id),
         )
 
         return final_result
